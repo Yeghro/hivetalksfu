@@ -243,7 +243,13 @@ class Transcription {
             transcriptionRoom.style.display = 'none';
         }
         this.isHidden = !this.isHidden;
+
         if (this.isPinned) this.unpinned();
+
+        if (!rc.isMobileDevice && !this.isHidden && rc.canBePinned()) {
+            this.togglePinUnpin();
+        }
+
         resizeTranscriptionRoom();
     }
 
@@ -318,6 +324,7 @@ class Transcription {
         transcriptionRoom.style.transform = null;
         document.documentElement.style.setProperty('--transcription-width', '25%');
         document.documentElement.style.setProperty('--transcription-height', '100%');
+        rc.resizeVideoMenuBar();
     }
 
     unpinned() {
@@ -334,6 +341,7 @@ class Transcription {
         this.center();
         this.isPinned = false;
         setColor(transcriptionTogglePinBtn, 'white');
+        rc.resizeVideoMenuBar();
         resizeVideoMedia();
         resizeTranscriptionRoom();
         transcriptionRoom.style.resize = 'both';

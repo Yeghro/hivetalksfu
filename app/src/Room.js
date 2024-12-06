@@ -47,6 +47,7 @@ module.exports = class Room {
             screen_cant_share: false,
             chat_cant_privately: false,
             chat_cant_chatgpt: false,
+            media_cant_sharing: false,
         };
         this.survey = config.survey;
         this.redirect = config.redirect;
@@ -65,6 +66,11 @@ module.exports = class Room {
 
         // Polls
         this.polls = [];
+
+        this.isHostProtected = config.host.protected;
+
+        // Share Media
+        this.shareMediaData = {};
     }
 
     // ####################################################
@@ -87,13 +93,23 @@ module.exports = class Room {
                 fromUrl: this.rtmp && this.rtmp.fromUrl,
                 fromStream: this.rtmp && this.rtmp.fromStream,
             },
+            hostProtected: this.isHostProtected,
             moderator: this._moderator,
             survey: this.survey,
             redirect: this.redirect,
             videoAIEnabled: this.videoAIEnabled,
             thereIsPolls: this.thereIsPolls(),
+            shareMediaData: this.shareMediaData,
             peers: JSON.stringify([...this.peers]),
         };
+    }
+
+    // ##############################################
+    // SHARE MEDIA
+    // ##############################################
+
+    updateShareMedia(data) {
+        this.shareMediaData = data;
     }
 
     // ##############################################
@@ -449,6 +465,9 @@ module.exports = class Room {
             case 'chat_cant_chatgpt':
                 this._moderator.chat_cant_chatgpt = data.status;
                 break;
+            case 'media_cant_sharing':
+                this._moderator.media_cant_sharing = data.status;
+                break;
             default:
                 break;
         }
@@ -534,7 +553,7 @@ module.exports = class Room {
             throw new Error('Create WebRtc Transport failed!');
         }
 
-        const { id, iceParameters, iceCandidates, dtlsParameters } = transport;
+        const { id, type, iceParameters, iceCandidates, dtlsParameters } = transport;
 
         if (maxIncomingBitrate) {
             try {
@@ -546,7 +565,7 @@ module.exports = class Room {
 
         peer.addTransport(transport);
 
-        log.debug('Transport created', { transportId: id });
+        log.debug('Transport created', { transportId: id, transportType: type });
 
         const { peer_name } = peer;
 
