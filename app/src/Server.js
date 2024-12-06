@@ -257,7 +257,6 @@ const views = {
     donate: path.join(__dirname, '../../', 'public/views/support.html'), // legacy so keep this line
     faq: path.join(__dirname, '../../', 'public/views/faq.html'),
     presskit: path.join(__dirname, '../../', 'public/views/presskit.html'),
-    whoAreYou: path.join(__dirname, '../../', 'public/views/whoAreYou.html'),
 };
 
 const authHost = new Host(); // Authenticated IP by Login
