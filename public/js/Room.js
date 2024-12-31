@@ -2256,7 +2256,7 @@ function roomIsReady() {
     if (!DetectRTC.isMobileDevice) show(pinUnpinGridDiv);
     if (!isSpeechSynthesisSupported) hide(speechMsgDiv);
     // If we want the sidebar collapsed and it's not already collapsed
-    toggleSidebar();
+    show(toggleExtraButton);
     handleButtons();
     handleSelects();
     handleInputs();
@@ -4105,17 +4105,12 @@ function showButtons() {
 }
 
 function checkButtonsBar() {
-    if (localStorageSettings.keep_buttons_visible) {
-        toggleButtonsBar('show');
-        isButtonsVisible = true;
-    } else {
-        if (!isButtonsBarOver && isButtonsVisible) {  // Only hide if visible and not being hovered
-            toggleButtonsBar('hide');
-            bottomButtons.style.display = 'none';
-            isButtonsVisible = false;
-        }
+    if (!isButtonsBarOver) {
+        control.style.display = 'none';
+        toggleExtraButton.innerHTML = icons.up;
+        bottomButtons.style.display = 'none';
+        isButtonsVisible = false;
     }
-    
     setTimeout(() => {
         checkButtonsBar();
     }, 10000);

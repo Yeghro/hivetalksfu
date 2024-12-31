@@ -2855,17 +2855,17 @@ class RoomClient {
         au = document.createElement('button');
         au.id = peer_id + '__audio';
         au.className = peer_audio ? html.audioOn : html.audioOff;
+
+        pv = document.createElement('input');
+        pv.id = 'remotePeer___' + peer_id + '___pVolume';
+        pv.type = 'range';
+        pv.min = 0;
+        pv.max = 100;
+        pv.value = 100;
+        peerNameContainer.appendChild(pv);
             
         // Create and append controls for remote peers
-        if (remotePeer) {
-            pv = document.createElement('input');
-            pv.id = 'remotePeer___' + peer_id + '___pVolume';
-            pv.type = 'range';
-            pv.min = 0;
-            pv.max = 100;
-            pv.value = 100;
-            peerNameContainer.appendChild(pv);
-                    
+        if (remotePeer) {                    
 
             sf = document.createElement('button');
             sf.id = 'remotePeer___' + peer_id + '___sendFile';
