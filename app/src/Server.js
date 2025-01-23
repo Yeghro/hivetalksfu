@@ -8,14 +8,14 @@
 ███████ ███████ ██   ██   ████   ███████ ██   ██                                           
 
 prod dependencies: {
-    @ffmpeg-installer/ffmpeg: https://www.npmjs.com/package/@ffmpeg-installer/ffmpeg
+    @mattermost/client      : https://www.npmjs.com/package/@mattermost/client
     @sentry/node            : https://www.npmjs.com/package/@sentry/node
     axios                   : https://www.npmjs.com/package/axios
-    body-parser             : https://www.npmjs.com/package/body-parser
     compression             : https://www.npmjs.com/package/compression
     colors                  : https://www.npmjs.com/package/colors
     cors                    : https://www.npmjs.com/package/cors
     crypto-js               : https://www.npmjs.com/package/crypto-js
+    discord.js              : https://www.npmjs.com/package/discord.js
     dompurify               : https://www.npmjs.com/package/dompurify
     express                 : https://www.npmjs.com/package/express
     express-openid-connect  : https://www.npmjs.com/package/express-openid-connect
@@ -55,7 +55,7 @@ dev dependencies: {
  * @license For commercial or closed source, contact us at license.mirotalk@gmail.com or purchase directly via CodeCanyon
  * @license CodeCanyon: https://codecanyon.net/item/mirotalk-sfu-webrtc-realtime-video-conferences/40769970
  * @author  Miroslav Pejic - miroslav.pejic.85@gmail.com
- * @version 1.5.67
+ * @version 1.6.31
  *
  */
 
@@ -87,8 +87,12 @@ const yaml = require('js-yaml');
 const swaggerUi = require('swagger-ui-express');
 const swaggerDocument = yaml.load(fs.readFileSync(path.join(__dirname, '/../api/swagger.yaml'), 'utf8'));
 const Sentry = require('@sentry/node');
+// const Discord = require('./Discord.js');
+// const Mattermost = require('./Mattermost.js');
 const restrictAccessByIP = require('./middleware/IpWhitelist.js');
 const packageJson = require('../../package.json');
+const { invokeCheckRoomOwner } = require('./checkRoomOwner');
+const { createClient } = require('@supabase/supabase-js');
 
 // Incoming Stream to RTPM
 const { v4: uuidv4 } = require('uuid');
@@ -109,7 +113,6 @@ const CryptoJS = require('crypto-js');
 const qS = require('qs');
 const slackEnabled = config.slack.enabled;
 const slackSigningSecret = config.slack.signingSecret;
-const bodyParser = require('body-parser');
 
 const app = express();
 
@@ -153,11 +156,17 @@ const jwtCfg = {
 const hostCfg = {
     protected: config.host.protected,
     user_auth: config.host.user_auth,
+    users: config.host.users,
     users_from_db: config.host.users_from_db,
+    users_api_room_allowed: config.host.users_api_room_allowed,
+    users_api_rooms_allowed: config.host.users_api_rooms_allowed,
     users_api_endpoint: config.host.users_api_endpoint,
     users_api_secret_key: config.host.users_api_secret_key,
+    api_room_exists: config.host.api_room_exists,
     users: config.host.users,
     authenticated: !config.host.protected,
+    nostr_api_endpoint: config.host.nostr_api_endpoint,
+    nostr_api_secret_key: config.host.nostr_api_secret_key,
 };
 
 const restApi = {
@@ -188,6 +197,14 @@ if (sentryEnabled) {
     log.error('test-error');
     log.debug('test-debug');
 */
+}
+
+// Discord Bot
+const { enabled, commands, token } = config.discord || {};
+
+if (enabled && commands.length > 0 && token) {
+    const discordBot = new Discord(token, commands);
+    log.info('Discord bot is enabled and starting');
 }
 
 // Stats
@@ -244,6 +261,7 @@ const views = {
     donate: path.join(__dirname, '../../', 'public/views/support.html'), // legacy so keep this line
     faq: path.join(__dirname, '../../', 'public/views/faq.html'),
     presskit: path.join(__dirname, '../../', 'public/views/presskit.html'),
+    whoAreYou: path.join(__dirname, '../../', 'public/views/whoAreYou.html'),
 };
 
 const authHost = new Host(); // Authenticated IP by Login
@@ -316,7 +334,6 @@ function OIDCAuth(req, res, next) {
                     log.debug('[OIDC] ------> Host protected', {
                         authenticated: hostCfg.authenticated,
                         authorizedIPs: authHost.getAuthorizedIPs(),
-                        activeRoom: authHost.isRoomActive(),
                     });
                 }
                 next();
@@ -351,12 +368,12 @@ function getMeetCount(roomList) {
 
 function startServer() {
     // Start the app
+    app.use(express.static(dir.public));
     app.use(cors(corsOptions));
     app.use(compression());
-    app.use(express.json({ limit: '50mb' })); // Ensure the body parser can handle large files
-    app.use(express.static(dir.public));
-    app.use(bodyParser.urlencoded({ extended: true }));
-    app.use(bodyParser.raw({ type: 'video/webm', limit: '50mb' })); // handle raw binary data
+    app.use(express.json({ limit: '50mb' })); // Handles JSON payloads
+    app.use(express.urlencoded({ extended: true, limit: '50mb' })); // Handles URL-encoded payloads
+    app.use(express.raw({ type: 'video/webm', limit: '50mb' })); // Handles raw binary data
     app.use(restApi.basePath + '/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument)); // api docs
 
     // IP Whitelist check ...
@@ -373,7 +390,7 @@ function startServer() {
 
     // Middleware to handle both .html and .handlebars templates
     app.use((req, res, next) => {
-        // Extend res.render to try both .html and .handlebars
+        // Extend res.render to try both .handlebars first
         const originalRender = res.render;
         res.render = function(view, locals, callback) {
             // Try .handlebars first
@@ -403,6 +420,9 @@ function startServer() {
         next();
     });
     */
+
+    // Mattermost
+    // const mattermost = new Mattermost(app);
 
     // POST start from here...
     app.post('*', function (next) {
@@ -487,9 +507,22 @@ function startServer() {
     // Route to display user information
     app.get('/profile', OIDCAuth, (req, res) => {
         if (OIDC.enabled) {
-            return res.json(req.oidc.user); // Send user information as JSON
+            const user = { ...req.oidc.user };
+            user.peer_name = {
+                force: OIDC.peer_name?.force || false,
+                email: OIDC.peer_name?.email || false,
+                name: OIDC.peer_name?.name || false,
+            };
+            log.debug('OIDC get Profile', user);
+            return res.json(user);
         }
-        res.sendFile(views.notFound);
+        // OIDC disabled
+        res.status(201).json({
+            email: false,
+            name: false,
+            peer_name: false,
+            message: 'Profile not found because OIDC is disabled',
+        });
     });
 
     // Authentication Callback Route
@@ -511,7 +544,6 @@ function startServer() {
                 log.debug('[OIDC] ------> Logout', {
                     authenticated: hostCfg.authenticated,
                     authorizedIPs: authHost.getAuthorizedIPs(),
-                    activeRoom: authHost.isRoomActive(),
                 });
             }
             req.logout(); // Logout user
@@ -532,7 +564,8 @@ function startServer() {
     // main page
     app.get(['/'], OIDCAuth, (req, res) => {
         //log.debug('/ - hostCfg ----->', hostCfg);
-        if ((!OIDC.enabled && hostCfg.protected && !hostCfg.authenticated) || authHost.isRoomActive()) {
+
+        if (!OIDC.enabled && hostCfg.protected) {
             const ip = getIP(req);
             if (allowedIP(ip)) {
                 //res.sendFile(views.landing);
@@ -560,17 +593,30 @@ function startServer() {
     app.get(['/newroom'], OIDCAuth, (req, res) => {
         //log.info('/newroom - hostCfg ----->', hostCfg);
 
-        if ((!OIDC.enabled && hostCfg.protected && !hostCfg.authenticated) || authHost.isRoomActive()) {
+        if (!OIDC.enabled && hostCfg.protected) {
             const ip = getIP(req);
             if (allowedIP(ip)) {
-                res.sendFile(views.newRoom);
+                res.redirect('/');
                 hostCfg.authenticated = true;
             } else {
                 hostCfg.authenticated = false;
-                res.sendFile(views.login);
+                res.redirect('/login');
             }
         } else {
             res.sendFile(views.newRoom);
+        }
+    });
+
+    // Check if room active (exists)
+    app.post(['/isRoomActive'], (req, res) => {
+        const { roomId } = checkXSS(req.body);
+
+        if (roomId && (hostCfg.protected || hostCfg.user_auth)) {
+            const roomActive = roomList.has(roomId);
+            if (roomActive) log.debug('isRoomActive', { roomId, roomActive });
+            res.status(200).json({ message: roomActive });
+        } else {
+            res.status(400).json({ message: 'Unauthorized' });
         }
     });
 
@@ -584,7 +630,8 @@ function startServer() {
             // http://localhost:3010/join?room=test&roomPassword=0&name=mirotalksfu&audio=1&video=1&screen=0&hide=0&notify=1
             // http://localhost:3010/join?room=test&roomPassword=0&name=mirotalksfu&audio=1&video=1&screen=0&hide=0&notify=0&token=token
 
-            const { room, roomPassword, name, audio, video, screen, hide, notify, token, isPresenter } = checkXSS(
+            // https://localhost:3010/join?room=yourname&nip98=nip98token  // 60 second expiration
+            const { room, roomPassword, name, audio, video, screen, hide, notify, token, nip98, isPresenter } = checkXSS(
                 req.query,
             );
 
@@ -598,26 +645,41 @@ function startServer() {
             let peerPassword = '';
             let isPeerValid = false;
             let isPeerPresenter = false;
+            
+            // TODO: Finish nip98 auth here  - dashboard login 60 sec expiration
+            // if (nip98) {                 
+            //     validateNip98Token(nip98).then((result) => {
+            //         if (result) {
+            //             log.debug('Direct Join NIP98 Success');
+            //         }
+            //     }).catch((error) => {
+            //         log.error('Direct Join NIP98 error', { error: error.message });
+            //     })
+            // }
 
+            // TODO: disallow reserved rooms if not owner  
             if (token) {
                 try {
                     const validToken = await isValidToken(token);
-
                     if (!validToken) {
                         return res.status(401).json({ message: 'Invalid Token' });
                     }
 
                     const { username, password, presenter } = checkXSS(decodeToken(token));
-
                     peerUsername = username;
                     peerPassword = password;
                     isPeerValid = await isAuthPeer(username, password);
                     isPeerPresenter = presenter === '1' || presenter === 'true';
 
                     if (isPeerPresenter && !hostCfg.users_from_db) {
-                        const roomAllowedForUser = isRoomAllowedForUser('Direct Join with token', username, room);
+                        const roomAllowedForUser = await isRoomAllowedForUser('Direct Join with token', username, room);
                         if (!roomAllowedForUser) {
-                            return res.status(401).json({ message: 'Direct Room Join for this User is Unauthorized' });
+                            log.warn('Direct Room Join for this User is Unauthorized', {
+                                username: username,
+                                room: room,
+                            });
+                            return res.redirect('/whoAreYou/' + room);
+                            //return res.status(401).json({ message: 'Direct Room Join for this User is Unauthorized' });
                         }
                     }
                 } catch (err) {
@@ -628,12 +690,13 @@ function startServer() {
                 }
             } else {
                 const allowRoomAccess = isAllowedRoomAccess('/join/params', req, hostCfg, authHost, roomList, room);
-                const roomAllowedForUser = isRoomAllowedForUser('Direct Join with token', name, room);
+                const roomAllowedForUser = await isRoomAllowedForUser('Direct Join without token', name, room);
                 if (!allowRoomAccess && !roomAllowedForUser) {
-                    return res.status(401).json({ message: 'Direct Room Join Unauthorized' });
+                    log.warn('Direct Room Join Unauthorized', room);
+                    return res.redirect('/whoAreYou/' + room);
+                    //return res.status(401).json({ message: 'Direct Room Join Unauthorized' });
                 }
             }
-
             const OIDCUserAuthenticated = OIDC.enabled && req.oidc.isAuthenticated();
 
             if (
@@ -659,26 +722,49 @@ function startServer() {
     });
 
     // join room by id
-    app.get('/join/:roomId', (req, res) => {
-        //
-        const roomId = req.params.roomId;
+    app.get('/join/:roomId', async (req, res) => {
+        const { roomId } = req.params;
+
+        if (!roomId) {
+            log.warn('/join/:roomId empty', roomId);
+            return res.redirect('/');
+        }
 
         if (!Validator.isValidRoomName(roomId)) {
             log.warn('/join/:roomId invalid', roomId);
             return res.redirect('/');
         }
 
+        // Get room info from Supabase
+        const roomInfo = await getRoomInfo(roomId);
+        
+        // Read the room.html file
+        const roomHtml = fs.readFileSync(views.room, 'utf8');
+        
+        // Inject custom OG tags if room info exists
+        const htmlWithOG = roomInfo ? injectOGTags(roomHtml, roomInfo) : roomHtml;
+
         const allowRoomAccess = isAllowedRoomAccess('/join/:roomId', req, hostCfg, authHost, roomList, roomId);
 
         if (allowRoomAccess) {
-            if (hostCfg.protected) authHost.setRoomActive();
-
-            res.sendFile(views.room);
-        } else {
-            if (!OIDC.enabled && hostCfg.protected) {
-                return res.sendFile(views.login);
+            // 1. Protect room access with database check
+            if (!OIDC.enabled && hostCfg.protected && hostCfg.users_from_db) {
+                const roomExists = await roomExistsForUser(roomId);
+                log.debug('/join/:roomId exists from API endpoint', roomExists);
+                return roomExists ? res.send(htmlWithOG) : res.redirect('/login');
             }
-            res.redirect('/');
+            // 2. Protect room access with configuration check
+            if (!OIDC.enabled && hostCfg.protected && !hostCfg.users_from_db) {
+                const roomExists = hostCfg.users.some(
+                    (user) => user.allowed_rooms && user.allowed_rooms.includes(roomId),
+                );
+                log.debug('/join/:roomId exists from config allowed rooms', roomExists);
+                return roomExists ? res.send(htmlWithOG) : res.redirect('/whoAreYou/' + roomId);
+            }
+            res.send(htmlWithOG);
+        } else {
+            // Who are you?
+            !OIDC.enabled && hostCfg.protected ? res.redirect('/whoAreYou/' + roomId) : res.redirect('/');
         }
     });
 
@@ -729,6 +815,11 @@ function startServer() {
         res.send(stats);
     });
 
+    // handle who are you: Presenter or Guest
+    app.get(['/whoAreYou/:roomId'], (req, res) => {
+        res.sendFile(views.whoAreYou);
+    });
+
     // handle login if user_auth enabled
     app.get(['/login'], (req, res) => {
         res.sendFile(views.login);
@@ -738,12 +829,38 @@ function startServer() {
     app.get(['/logged'], (req, res) => {
         const ip = getIP(req);
         if (allowedIP(ip)) {
-            res.sendFile(views.newRoom);
+            res.redirect('/');
             hostCfg.authenticated = true;
         } else {
             hostCfg.authenticated = false;
             res.sendFile(views.login);
         }
+    });
+
+    // handle nostr protected login rooms
+    // check for nostr authentication to start room
+        // if open to the public let anyone auth into the room
+        // if not open to the public then check the database for allowed users
+        // nostr_api_endpoint : https://supabase-url/api/v1/nostrAuth 
+        // nostr_api_secret_key: 'insert your secret key here'
+
+    app.post(['/nauth'], (req, res) => {
+        // nip98 nostr auth api endpoint 
+        // check if request is valid.
+        res.sendFile(views.newRoom);
+    });
+
+    // handle nostr protected login rooms
+    // check for nostr authentication to start room
+        // if open to the public let anyone auth into the room
+        // if not open to the public then check the database for allowed users
+        // nostr_api_endpoint : https://supabase-url/api/v1/nostrAuth 
+        // nostr_api_secret_key: 'insert your secret key here'
+
+    app.post(['/nauth'], (req, res) => {
+        // nip98 nostr auth api endpoint 
+        // check if request is valid.
+        res.sendFile(views.newRoom);
     });
 
     // ####################################################
@@ -777,7 +894,9 @@ function startServer() {
                       config.presenters.list.includes(username).toString();
 
             const token = encodeToken({ username: username, password: password, presenter: isPresenter });
-            return res.status(200).json({ message: token });
+            const allowedRooms = await getUserAllowedRooms(username, password);
+
+            return res.status(200).json({ message: token, allowedRooms: allowedRooms });
         }
 
         if (isPeerValid) {
@@ -785,7 +904,8 @@ function startServer() {
             const isPresenter =
                 config.presenters && config.presenters.list && config.presenters.list.includes(username).toString();
             const token = encodeToken({ username: username, password: password, presenter: isPresenter });
-            return res.status(200).json({ message: token });
+            const allowedRooms = await getUserAllowedRooms(username, password);
+            return res.status(200).json({ message: token, allowedRooms: allowedRooms });
         } else {
             return res.status(401).json({ message: 'unauthorized' });
         }
@@ -1156,6 +1276,27 @@ function startServer() {
         });
     });
 
+    // API endpoint for room ownership check
+    app.post('/api/check-room-owner', async (req, res) => {
+        try {
+            const { room_id } = req.body;
+            const data = await invokeCheckRoomOwner(room_id);
+            res.json(data);
+        } catch (error) {
+            console.error('Error checking room ownership:', error);
+            res.status(500).json({ error: 'Failed to check room ownership' });
+        }
+    });
+
+    app.post('/api/check-room-peers', async (req, res) => {
+        const { room_id } = req.body;
+        const room = roomList.get(room_id);    
+        const peerCount = room ? room.peers.size : 0;
+        console.log('check-room-peers --> ', peerCount);
+
+        res.json({ peerCount });
+    });
+
     // ####################################################
     // SLACK API
     // ####################################################
@@ -1204,29 +1345,53 @@ function startServer() {
 
     function getServerConfig(tunnel = false) {
         return {
-            app_version: packageJson.version,
-            node_version: process.versions.node,
-            cors_options: corsOptions,
-            middleware: config.middleware,
+            // General Server Information
             server_listen: host,
             server_tunnel: tunnel,
-            hostConfig: hostCfg,
+
+            // Core Configurations
+            cors_options: corsOptions,
             jwtCfg: jwtCfg,
-            presenters: config.presenters,
             rest_api: restApi,
+
+            // Middleware and UI
+            middleware: config.middleware,
+            configUI: config.ui,
+
+            // Security, Authorization, and User Management
+            oidc: OIDC.enabled ? OIDC : false,
+            hostProtected: hostCfg.protected || hostCfg.user_auth ? hostCfg : false,
+            ip_lookup_enabled: config.IPLookup?.enabled ? config.IPLookup : false,
+            presenters: config.presenters,
+
+            // Communication Integrations
+            discord_enabled: config.discord?.enabled ? config.discord : false,
+            mattermost_enabled: config.mattermost?.enabled ? config.mattermost : false,
+            slack_enabled: slackEnabled ? config.slack : false,
+            chatGPT_enabled: config.chatGPT?.enabled ? config.chatGPT : false,
+
+            // Media and Video Configurations
+            mediasoup_listenInfos: config.mediasoup.webRtcTransport.listenInfos,
             mediasoup_worker_bin: mediasoup.workerBin,
+            rtmp_enabled: rtmpCfg.enabled ? rtmpCfg : false,
+            videAI_enabled: config.videoAI.enabled ? config.videoAI : false,
+            serverRec: config?.server?.recording,
+
+            // Centralized Logging
+            sentry_enabled: sentryEnabled ? config.sentry : false,
+
+            // Additional Configurations and Features
+            survey_enabled: config.survey?.enabled ? config.survey : false,
+            redirect_enabled: config.redirect?.enabled ? config.redirect : false,
+            stats_enabled: config.stats?.enabled ? config.stats : false,
+            ngrok_enabled: config.ngrok?.enabled ? config.ngrok : false,
+            email_alerts: config.email?.alert ? config.email : false,
+
+            // Version Information
+            app_version: packageJson.version,
+            node_version: process.versions.node,
             mediasoup_server_version: mediasoup.version,
             mediasoup_client_version: mediasoupClient.version,
-            mediasoup_listenInfos: config.mediasoup.webRtcTransport.listenInfos,
-            ip_lookup_enabled: config.IPLookup.enabled,
-            sentry_enabled: sentryEnabled,
-            redirect_enabled: config.redirect.enabled,
-            slack_enabled: slackEnabled,
-            stats_enabled: config.stats.enabled,
-            chatGPT_enabled: config.chatGPT.enabled,
-            configUI: config.ui,
-            serverRec: config?.server?.recording,
-            oidc: OIDC.enabled ? OIDC : false,
         };
     }
 
@@ -1390,6 +1555,8 @@ function startServer() {
         });
 
         socket.on('join', async (dataObject, cb) => {
+            // TODO: Check if is Room is Reserved on on database
+
             if (!roomList.has(socket.room_id)) {
                 return cb({
                     error: 'Room does not exist',
@@ -1414,11 +1581,12 @@ function startServer() {
                 return cb('invalid');
             }
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
-            const { peer_name, peer_id, peer_uuid, peer_token, os_name, os_version, browser_name, browser_version } =
+            const { peer_name, peer_pubkey, peer_id, peer_uuid, peer_token, os_name, os_version, browser_name, browser_version } =
                 data.peer_info;
 
+            console.log('>>>>> [Join] <<<< - socket.on Peer Info', {peer_name: peer_name, peer_pubkey: peer_pubkey, peer_id: peer_id});
             let is_presenter = true;
 
             // User Auth required or detect token, we check if peer valid
@@ -1429,6 +1597,7 @@ function startServer() {
                         const validToken = await isValidToken(peer_token);
 
                         if (!validToken) {
+                            log.warn('[Join] - Invalid token', peer_token);
                             return cb('unauthorized');
                         }
 
@@ -1438,6 +1607,7 @@ function startServer() {
 
                         if (!isPeerValid) {
                             // redirect peer to login page
+                            log.warn('[Join] - Invalid peer not authenticated', isPeerValid);
                             return cb('unauthorized');
                         }
 
@@ -1461,12 +1631,13 @@ function startServer() {
                         return cb('unauthorized');
                     }
                 } else {
-                    return cb('unauthorized');
+                    if (!hostCfg.users_from_db) return cb('unauthorized');
                 }
 
                 if (!hostCfg.users_from_db) {
                     const roomAllowedForUser = isRoomAllowedForUser('[Join]', peer_name, room.id);
                     if (!roomAllowedForUser) {
+                        log.warn('[Join] - Room not allowed for this peer', { peer_name, room_id: room.id });
                         return cb('notAllowed');
                     }
                 }
@@ -1553,6 +1724,7 @@ function startServer() {
             if ((hostCfg.protected || hostCfg.user_auth) && isPresenter && !hostCfg.users_from_db) {
                 const roomAllowedForUser = isRoomAllowedForUser('[Join]', peer_name, room.id);
                 if (!roomAllowedForUser) {
+                    log.warn('[Join] - Room not allowed for this peer', { peer_name, room_id: room.id });
                     return cb('notAllowed');
                 }
             }
@@ -1572,13 +1744,16 @@ function startServer() {
         });
 
         socket.on('getRouterRtpCapabilities', (_, callback) => {
-            if (!roomList.has(socket.room_id)) {
+            if (!roomExists(socket)) {
                 return callback({ error: 'Room not found' });
             }
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            log.debug('Get RouterRtpCapabilities', getPeerName(room));
+            const { peer_name } = peer || 'undefined';
+
+            log.debug('Get RouterRtpCapabilities', peer_name);
+
             try {
                 const getRouterRtpCapabilities = room.getRtpCapabilities();
 
@@ -1594,13 +1769,15 @@ function startServer() {
         });
 
         socket.on('createWebRtcTransport', async (_, callback) => {
-            if (!roomList.has(socket.room_id)) {
+            if (!roomExists(socket)) {
                 return callback({ error: 'Room not found' });
             }
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            log.debug('Create WebRtc transport', getPeerName(room));
+            const { peer_name } = peer || 'undefined';
+
+            log.debug('Create WebRtc transport', peer_name);
 
             try {
                 const createWebRtcTransport = await room.createWebRtcTransport(socket.id);
@@ -1617,13 +1794,13 @@ function startServer() {
         });
 
         socket.on('connectTransport', async ({ transport_id, dtlsParameters }, callback) => {
-            if (!roomList.has(socket.room_id)) {
+            if (!roomExists(socket)) {
                 return callback({ error: 'Room not found' });
             }
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            const peer_name = getPeerName(room, false);
+            const { peer_name } = peer || 'undefined';
 
             log.debug('Connect transport', { peer_name: peer_name, transport_id: transport_id });
 
@@ -1642,15 +1819,17 @@ function startServer() {
         });
 
         socket.on('restartIce', async ({ transport_id }, callback) => {
-            if (!roomList.has(socket.room_id)) {
+            if (!roomExists(socket)) {
                 return callback({ error: 'Room not found' });
             }
 
-            const room = roomList.get(socket.room_id);
+            const peer = getPeer(socket);
 
-            const peer = room.getPeer(socket.id);
+            if (!peer) {
+                return callback({ error: 'Peer not found' });
+            }
 
-            const peer_name = getPeerName(room, false);
+            const { peer_name } = peer || 'undefined';
 
             log.debug('Restart ICE', { peer_name: peer_name, transport_id: transport_id });
 
@@ -1675,13 +1854,17 @@ function startServer() {
         });
 
         socket.on('produce', async ({ producerTransportId, kind, appData, rtpParameters }, callback, errback) => {
-            if (!roomList.has(socket.room_id)) {
+            if (!roomExists(socket)) {
                 return callback({ error: 'Room not found' });
             }
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            const peer_name = getPeerName(room, false);
+            if (!peer) {
+                return callback({ error: 'Peer not found' });
+            }
+
+            const { peer_name } = peer || 'undefined';
 
             // peer_info.audio OR video ON
             const data = {
@@ -1692,8 +1875,6 @@ function startServer() {
                 type: appData.mediaType,
                 status: true,
             };
-
-            const peer = room.getPeer(socket.id);
 
             peer.updatePeerInfo(data);
 
@@ -1734,13 +1915,13 @@ function startServer() {
         });
 
         socket.on('consume', async ({ consumerTransportId, producerId, rtpCapabilities }, callback) => {
-            if (!roomList.has(socket.room_id)) {
+            if (!roomExists(socket)) {
                 return callback({ error: 'Room not found' });
             }
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            const peer_name = getPeerName(room, false);
+            const { peer_name } = peer || 'undefined';
 
             try {
                 const params = await room.consume(socket.id, consumerTransportId, producerId, rtpCapabilities);
@@ -1763,11 +1944,11 @@ function startServer() {
         });
 
         socket.on('producerClosed', (data) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            const peer = room.getPeer(socket.id);
+            if (!peer) return;
 
             peer.updatePeerInfo(data); // peer_info.audio OR video OFF
 
@@ -1775,24 +1956,20 @@ function startServer() {
         });
 
         socket.on('pauseProducer', async ({ producer_id }, callback) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
-
-            const peer_name = getPeerName(room, false);
-
-            const peer = room.getPeer(socket.id);
+            const peer = getPeer(socket);
 
             if (!peer) {
                 return callback({
-                    error: `peer with ID: ${socket.id} for producer with id "${producer_id}" not found`,
+                    error: `Peer with ID: ${socket.id} for producer with id "${producer_id}" not found`,
                 });
             }
 
             const producer = peer.getProducer(producer_id);
 
             if (!producer) {
-                return callback({ error: `producer with id "${producer_id}" not found` });
+                return callback({ error: `Producer with id "${producer_id}" not found` });
             }
 
             try {
@@ -1801,19 +1978,17 @@ function startServer() {
                 return callback({ error: error.message });
             }
 
+            const { peer_name } = peer || 'undefined';
+
             log.debug('Producer paused', { peer_name: peer_name, producer_id: producer_id });
 
             callback('successfully');
         });
 
         socket.on('resumeProducer', async ({ producer_id }, callback) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
-
-            const peer_name = getPeerName(room, false);
-
-            const peer = room.getPeer(socket.id);
+            const peer = getPeer(socket);
 
             if (!peer) {
                 return callback({
@@ -1833,19 +2008,17 @@ function startServer() {
                 return callback({ error: error.message });
             }
 
+            const { peer_name } = peer || 'undefined';
+
             log.debug('Producer resumed', { peer_name: peer_name, producer_id: producer_id });
 
             callback('successfully');
         });
 
         socket.on('resumeConsumer', async ({ consumer_id }, callback) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
-
-            const peer_name = getPeerName(room, false);
-
-            const peer = room.getPeer(socket.id);
+            const peer = getPeer(socket);
 
             if (!peer) {
                 return callback({
@@ -1865,17 +2038,21 @@ function startServer() {
                 return callback({ error: error.message });
             }
 
+            const { peer_name } = peer || 'undefined';
+
             log.debug('Consumer resumed', { peer_name: peer_name, consumer_id: consumer_id });
 
             callback('successfully');
         });
 
         socket.on('getProducers', () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            log.debug('Get producers', getPeerName(room));
+            const { peer_name } = peer || 'undefined';
+
+            log.debug('Get producers', peer_name);
 
             // send all the current producer to newly joined member
             const producerList = room.getProducerListForPeer();
@@ -1884,9 +2061,9 @@ function startServer() {
         });
 
         socket.on('getPeerCounts', async ({}, callback) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const peerCounts = room.getPeersCount();
 
@@ -1896,23 +2073,30 @@ function startServer() {
         });
 
         socket.on('cmd', async (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
             log.debug('cmd', data);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
+
+            const peer = getPeer(socket);
 
             switch (data.type) {
                 case 'privacy':
-                    const peer = room.getPeer(socket.id);
                     peer.updatePeerInfo({ type: data.type, status: data.active });
                     break;
                 case 'ejectAll':
                     const { peer_name, peer_uuid } = data;
                     const isPresenter = await isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
                     if (!isPresenter) return;
+                    break;
+                case 'peerAudio':
+                    // Keep producer volume to update consumer on join room...
+                    if (data.audioProducerId) {
+                        peer.updatePeerInfo({ type: data.type, volume: data.volume * 100 });
+                    }
                     break;
                 default:
                     break;
@@ -1923,13 +2107,13 @@ function startServer() {
         });
 
         socket.on('roomAction', async (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
             const isPresenter = await isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             log.debug('Room action:', data);
 
@@ -1998,11 +2182,11 @@ function startServer() {
         });
 
         socket.on('roomLobby', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             data.room = room.toJson();
 
@@ -2024,7 +2208,7 @@ function startServer() {
         });
 
         socket.on('peerAction', async (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
@@ -2052,25 +2236,23 @@ function startServer() {
                 if (!isPresenter) return;
             }
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             if (data.action === 'ban') room.addBannedPeer(data.to_peer_uuid);
 
             data.broadcast
-                ? room.broadCast(data.peer_id, 'peerAction', data)
+                ? room.broadCast(socket.id, 'peerAction', data)
                 : room.sendTo(data.peer_id, 'peerAction', data);
         });
 
         socket.on('updatePeerInfo', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const data = checkXSS(dataObject);
-
-            const room = roomList.get(socket.room_id);
-
-            const peer = room.getPeer(socket.id);
+            const { room, peer } = getRoomAndPeer(socket);
 
             if (!peer) return;
+
+            const data = checkXSS(dataObject);
 
             peer.updatePeerInfo(data);
 
@@ -2081,11 +2263,11 @@ function startServer() {
         });
 
         socket.on('updateRoomModerator', async (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const isPresenter = await isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
 
@@ -2101,6 +2283,7 @@ function startServer() {
                 case 'screen_cant_share':
                 case 'chat_cant_privately':
                 case 'chat_cant_chatgpt':
+                case 'media_cant_sharing':
                     room.broadCast(socket.id, 'updateRoomModerator', moderator);
                     break;
                 default:
@@ -2109,11 +2292,11 @@ function startServer() {
         });
 
         socket.on('updateRoomModeratorALL', async (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const isPresenter = await isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
 
@@ -2127,17 +2310,19 @@ function startServer() {
         });
 
         socket.on('getRoomInfo', async (_, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            log.debug('Send Room Info to', getPeerName(room));
+            const { peer_name } = peer || 'undefined';
+
+            log.debug('Send Room Info to', peer_name);
 
             cb(room.toJson());
         });
 
         socket.on('fileInfo', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
@@ -2148,37 +2333,41 @@ function startServer() {
 
             log.debug('Send File Info', data);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             data.broadcast ? room.broadCast(socket.id, 'fileInfo', data) : room.sendTo(data.peer_id, 'fileInfo', data);
         });
 
         socket.on('file', (data) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             data.broadcast ? room.broadCast(socket.id, 'file', data) : room.sendTo(data.peer_id, 'file', data);
         });
 
         socket.on('fileAbort', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            roomList.get(socket.room_id).broadCast(socket.id, 'fileAbort', data);
+            const room = getRoom(socket);
+
+            room.broadCast(socket.id, 'fileAbort', data);
         });
 
         socket.on('receiveFileAbort', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            roomList.get(socket.room_id).broadCast(socket.id, 'receiveFileAbort', data);
+            const room = getRoom(socket);
+
+            room.broadCast(socket.id, 'receiveFileAbort', data);
         });
 
         socket.on('shareVideoAction', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
@@ -2189,7 +2378,9 @@ function startServer() {
 
             log.debug('Share video: ', data);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
+
+            room.updateShareMedia(data);
 
             data.peer_id == 'all'
                 ? room.broadCast(socket.id, 'shareVideoAction', data)
@@ -2197,11 +2388,12 @@ function startServer() {
         });
 
         socket.on('wbCanvasToJson', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const data = checkXSS(dataObject);
+            //const data = checkXSS(dataObject);
+            const data = dataObject;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             // const objLength = bytesToSize(Object.keys(data).length);
 
@@ -2211,44 +2403,44 @@ function startServer() {
         });
 
         socket.on('whiteboardAction', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             log.debug('Whiteboard', data);
             room.broadCast(socket.id, 'whiteboardAction', data);
         });
 
         socket.on('setVideoOff', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
             log.debug('Video off data', data.peer_name);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             room.broadCast(socket.id, 'setVideoOff', data);
         });
 
         socket.on('recordingAction', async (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
             log.debug('Recording action', data);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             room.broadCast(socket.id, 'recordingAction', data);
         });
 
         socket.on('refreshParticipantsCount', () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const peerCounts = room.getPeers().size;
 
@@ -2261,18 +2453,19 @@ function startServer() {
         });
 
         socket.on('message', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
 
-            // check if the message coming from real peer
-            const realPeer = isRealPeer(data.peer_name, socket.id, socket.room_id);
+            const { peer_name } = peer || 'undefined';
+
+            const realPeer = data.peer_name === peer_name;
 
             if (!realPeer) {
-                const peer_name = getPeerName(room, false);
-                log.debug('Fake message detected', {
+                log.warn('Fake message detected', {
+                    ip: getIpSocket(socket),
                     realFrom: peer_name,
                     fakeFrom: data.peer_name,
                     msg: data.peer_msg,
@@ -2288,8 +2481,10 @@ function startServer() {
         });
 
         socket.on('getChatGPT', async ({ time, room, name, prompt, context }, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             if (!config.chatGPT.enabled) return cb({ message: 'ChatGPT seems disabled, try later!' });
+
             // https://platform.openai.com/docs/api-reference/completions/create
             try {
                 // Add the prompt to the context
@@ -2332,11 +2527,11 @@ function startServer() {
             }
         });
 
-        // https://docs.heygen.com/reference/overview-copy
-
+        // https://docs.heygen.com/reference/avatar-list
         socket.on('getAvatarList', async ({}, cb) => {
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
+
             try {
                 const response = await axios.get(`${config.videoAI.basePath}/v1/avatar.list`, {
                     headers: {
@@ -2356,9 +2551,11 @@ function startServer() {
             }
         });
 
+        // https://docs.heygen.com/reference/get-voices
         socket.on('getVoiceList', async ({}, cb) => {
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
+
             try {
                 const response = await axios.get(`${config.videoAI.basePath}/v1/voice.list`, {
                     headers: {
@@ -2378,29 +2575,29 @@ function startServer() {
             }
         });
 
-        socket.on('streamingNew', async ({ quality, avatar_name, voice_id }, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+        // https://docs.heygen.com/reference/new-session
+        socket.on('streamingNew', async ({ quality, avatar_id, voice_id }, cb) => {
+            if (!roomExists(socket)) return;
+
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
             try {
+                const voice = voice_id ? { voice_id: voice_id } : {};
                 const response = await axios.post(
                     `${config.videoAI.basePath}/v1/streaming.new`,
                     {
                         quality,
-                        avatar_name,
-                        voice: {
-                            voice_id: voice_id,
-                        },
+                        avatar_id,
+                        voice: voice,
                     },
                     {
                         headers: {
-                            'Content-Type': 'application/json',
-                            'X-Api-Key': config.videoAI.apiKey,
+                            accept: 'application/json',
+                            'content-type': 'application/json',
+                            'x-api-key': config.videoAI.apiKey,
                         },
                     },
                 );
-
-                log.warn('STREAMING NEW', response);
 
                 const data = { response: response.data };
 
@@ -2413,8 +2610,10 @@ function startServer() {
             }
         });
 
+        // https://docs.heygen.com/reference/start-session
         socket.on('streamingStart', async ({ session_id, sdp }, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
 
@@ -2441,8 +2640,10 @@ function startServer() {
             }
         });
 
+        // https://docs.heygen.com/reference/submit-ice-information
         socket.on('streamingICE', async ({ session_id, candidate }, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
 
@@ -2469,8 +2670,10 @@ function startServer() {
             }
         });
 
+        // https://docs.heygen.com/reference/send-task
         socket.on('streamingTask', async ({ session_id, text }, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
             try {
@@ -2499,8 +2702,41 @@ function startServer() {
             }
         });
 
+        // https://docs.heygen.com/reference/interrupt-task
+        socket.on('streamingInterrupt', async ({ session_id, text }, cb) => {
+            if (!roomExists(socket)) return;
+
+            if (!config.videoAI.enabled || !config.videoAI.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+
+            try {
+                const response = await axios.post(
+                    `${config.videoAI.basePath}/v1/streaming.interrupt`,
+                    {
+                        session_id,
+                    },
+                    {
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Api-Key': config.videoAI.apiKey,
+                        },
+                    },
+                );
+
+                const data = { response: response.data };
+
+                log.debug('streamingInterrupt', data);
+
+                cb(data);
+            } catch (error) {
+                log.error('streamingInterrupt', error.response.data);
+                cb({ error: error.response?.status === 500 ? 'Internal server error' : error.response.data.message });
+            }
+        });
+
         socket.on('talkToOpenAI', async ({ text, context }, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
             try {
@@ -2525,8 +2761,10 @@ function startServer() {
             }
         });
 
+        // https://docs.heygen.com/reference/close-session
         socket.on('streamingStop', async ({ session_id }, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             if (!config.videoAI.enabled || !config.videoAI.apiKey)
                 return cb({ error: 'Video AI seems disabled, try later!' });
             try {
@@ -2555,14 +2793,17 @@ function startServer() {
         });
 
         socket.on('getRTMP', async ({}, cb) => {
-            if (!roomList.has(socket.room_id)) return;
-            const room = roomList.get(socket.room_id);
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
             const rtmpFiles = await room.getRTMP(rtmpDir);
+
             cb(rtmpFiles);
         });
 
         socket.on('startRTMP', async (dataObject, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             if (rtmpCfg && rtmpFileStreamsCount >= rtmpCfg.maxStreams) {
                 log.warn('RTMP max file streams reached', rtmpFileStreamsCount);
@@ -2574,35 +2815,39 @@ function startServer() {
             const isPresenter = await isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
             if (!isPresenter) return cb(false);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
             const host = config.ngrok.enabled ? 'localhost' : socket.handshake.headers.host.split(':')[0];
             const rtmp = await room.startRTMP(socket.id, room, host, 1935, `../${rtmpDir}/${file}`);
 
             if (rtmp !== false) rtmpFileStreamsCount++;
+
             log.debug('startRTMP - rtmpFileStreamsCount ---->', rtmpFileStreamsCount);
 
             cb(rtmp);
         });
 
         socket.on('stopRTMP', async () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             rtmpFileStreamsCount--;
+
             log.debug('stopRTMP - rtmpFileStreamsCount ---->', rtmpFileStreamsCount);
 
             await room.stopRTMP();
         });
 
         socket.on('endOrErrorRTMP', async () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             rtmpFileStreamsCount--;
+
             log.debug('endRTMP - rtmpFileStreamsCount ---->', rtmpFileStreamsCount);
         });
 
         socket.on('startRTMPfromURL', async (dataObject, cb) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             if (rtmpCfg && rtmpUrlStreamsCount >= rtmpCfg.maxStreams) {
                 log.warn('RTMP max Url streams reached', rtmpUrlStreamsCount);
@@ -2614,41 +2859,45 @@ function startServer() {
             const isPresenter = await isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
             if (!isPresenter) return cb(false);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
             const host = config.ngrok.enabled ? 'localhost' : socket.handshake.headers.host.split(':')[0];
             const rtmp = await room.startRTMPfromURL(socket.id, room, host, 1935, inputVideoURL);
 
             if (rtmp !== false) rtmpUrlStreamsCount++;
+
             log.debug('startRTMPfromURL - rtmpUrlStreamsCount ---->', rtmpUrlStreamsCount);
 
             cb(rtmp);
         });
 
         socket.on('stopRTMPfromURL', async () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             rtmpUrlStreamsCount--;
+
             log.debug('stopRTMPfromURL - rtmpUrlStreamsCount ---->', rtmpUrlStreamsCount);
 
             await room.stopRTMPfromURL();
         });
 
         socket.on('endOrErrorRTMPfromURL', async () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
+
             rtmpUrlStreamsCount--;
+
             log.debug('endRTMPfromURL - rtmpUrlStreamsCount ---->', rtmpUrlStreamsCount);
         });
 
         socket.on('createPoll', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
             const { question, options } = data;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const newPoll = {
                 question: question,
@@ -2664,17 +2913,18 @@ function startServer() {
         });
 
         socket.on('vote', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            const room = roomList.get(socket.room_id);
+            const { room, peer } = getRoomAndPeer(socket);
+
+            const { peer_name } = peer || socket.id;
 
             const roomPolls = room.getPolls();
 
             const poll = roomPolls[data.pollIndex];
             if (poll) {
-                const peer_name = getPeerName(room, false) || socket.id;
                 poll.voters.set(peer_name, data.option);
                 room.sendToAll('updatePolls', room.convertPolls(roomPolls));
                 log.debug('[Poll] vote', roomPolls);
@@ -2682,9 +2932,9 @@ function startServer() {
         });
 
         socket.on('updatePoll', () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const roomPolls = room.getPolls();
 
@@ -2695,13 +2945,13 @@ function startServer() {
         });
 
         socket.on('editPoll', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
             const { index, question, options } = data;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const roomPolls = room.getPolls();
 
@@ -2714,7 +2964,7 @@ function startServer() {
         });
 
         socket.on('deletePoll', async (data) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const { index, peer_name, peer_uuid } = checkXSS(data);
 
@@ -2722,7 +2972,7 @@ function startServer() {
             // const isPresenter = await isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
             // if (!isPresenter) return;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             const roomPolls = room.getPolls();
 
@@ -2736,22 +2986,22 @@ function startServer() {
         // Room collaborative editor
 
         socket.on('editorChange', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             //const data = checkXSS(dataObject);
             const data = dataObject;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             room.broadCast(socket.id, 'editorChange', data);
         });
 
         socket.on('editorActions', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             const data = checkXSS(dataObject);
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             log.debug('editorActions', data);
 
@@ -2759,22 +3009,20 @@ function startServer() {
         });
 
         socket.on('editorUpdate', (dataObject) => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
             //const data = checkXSS(dataObject);
             const data = dataObject;
 
-            const room = roomList.get(socket.room_id);
+            const room = getRoom(socket);
 
             room.broadCast(socket.id, 'editorUpdate', data);
         });
 
         socket.on('disconnect', async () => {
-            if (!roomList.has(socket.room_id)) return;
+            if (!roomExists(socket)) return;
 
-            const room = roomList.get(socket.room_id);
-
-            const peer = room.getPeer(socket.id);
+            const { room, peer } = getRoomAndPeer(socket);
 
             const { peer_name, peer_uuid } = peer || {};
 
@@ -2811,15 +3059,13 @@ function startServer() {
         });
 
         socket.on('exitRoom', async (_, callback) => {
-            if (!roomList.has(socket.room_id)) {
+            if (!roomExists(socket)) {
                 return callback({
                     error: 'Not currently in a room',
                 });
             }
 
-            const room = roomList.get(socket.room_id);
-
-            const peer = room.getPeer(socket.id);
+            const { room, peer } = getRoomAndPeer(socket);
 
             const { peer_name, peer_uuid } = peer || {};
 
@@ -2858,33 +3104,27 @@ function startServer() {
         });
 
         // common
-        function getPeerName(room, json = true) {
-            try {
-                const DEFAULT_PEER_NAME = 'undefined';
-                const peer = room.getPeer(socket.id);
-                const peerName = peer.peer_name || DEFAULT_PEER_NAME;
-                if (json) {
-                    return { peer_name: peerName };
-                }
-                return peerName;
-            } catch (err) {
-                log.error('getPeerName', err);
-                return json ? { peer_name: DEFAULT_PEER_NAME } : DEFAULT_PEER_NAME;
-            }
+
+        function getRoomAndPeer(socket) {
+            const room = getRoom(socket);
+
+            const peer = getPeer(socket);
+
+            return { room, peer };
         }
 
-        function isRealPeer(name, id, roomId) {
-            if (!roomList.has(socket.room_id)) return false;
+        function getRoom(socket) {
+            return roomList.get(socket.room_id) || {};
+        }
 
-            const room = roomList.get(roomId);
+        function getPeer(socket) {
+            const room = getRoom(socket); // Reusing getRoom to retrieve the room
 
-            const peer = room.getPeer(id);
+            return room.getPeer ? room.getPeer(socket.id) || {} : {};
+        }
 
-            if (!peer) return false;
-
-            const { peer_name } = peer;
-
-            return peer_name == name;
+        function roomExists(socket) {
+            return roomList.has(socket.room_id);
         }
 
         function isValidFileName(fileName) {
@@ -2896,6 +3136,7 @@ function startServer() {
             const pattern = new RegExp(
                 '^(https?:\\/\\/)?' + // protocol
                     '((([a-z\\d]([a-z\\d-]*[a-z\\d])*)\\.)+[a-z]{2,}|' + // domain name
+                    'localhost|' + // allow localhost
                     '((\\d{1,3}\\.){3}\\d{1,3}))' + // OR ip (v4) address
                     '(\\:\\d+)?(\\/[-a-z\\d%_.~+]*)*' + // port and path
                     '(\\?[;&a-z\\d%_.~+=-]*)?' + // query string
@@ -3021,11 +3262,19 @@ function startServer() {
     async function isAuthPeer(username, password) {
         if (hostCfg.users_from_db && hostCfg.users_api_endpoint) {
             try {
-                const response = await axios.post(hostCfg.users_api_endpoint, {
-                    email: username,
-                    password: password,
-                    api_secret_key: hostCfg.users_api_secret_key,
-                });
+                // Using either email or username, as the username can also be an email here.
+                const response = await axios.post(
+                    hostCfg.users_api_endpoint,
+                    {
+                        email: username,
+                        username: username,
+                        password: password,
+                        api_secret_key: hostCfg.users_api_secret_key,
+                    },
+                    {
+                        timeout: 5000, // Timeout set to 5 seconds (5000 milliseconds)
+                    },
+                );
                 return response.data && response.data.message === true;
             } catch (error) {
                 log.error('AXIOS isAuthPeer error', error.message);
@@ -3110,36 +3359,104 @@ function startServer() {
     }
 
     function isAllowedRoomAccess(logMessage, req, hostCfg, authHost, roomList, roomId) {
+        console.log('roomList type:', typeof roomList, roomList instanceof Map, roomList);
         const OIDCUserAuthenticated = OIDC.enabled && req.oidc.isAuthenticated();
-        const hostUserAuthenticated = hostCfg.protected && hostCfg.authenticated;
-        const roomActive = authHost.isRoomActive();
+        const hostUserAuthenticated = hostCfg.protected && authHost.authenticated;
         const roomExist = roomList.has(roomId);
         const roomCount = roomList.size;
 
         const allowRoomAccess =
             (!hostCfg.protected && !OIDC.enabled) || // No host protection and OIDC mode enabled (default)
-            OIDCUserAuthenticated || // User authenticated via OIDC
-            hostUserAuthenticated || // User authenticated via Login
+            (OIDCUserAuthenticated && roomExist) || // User authenticated via OIDC and room Exist
+            (hostUserAuthenticated && roomExist) || // User authenticated via Login and room Exist
             ((OIDCUserAuthenticated || hostUserAuthenticated) && roomCount === 0) || // User authenticated joins the first room
             roomExist; // User Or Guest join an existing Room
 
         log.debug(logMessage, {
-            OIDCUserEnabled: OIDC.enabled,
             OIDCUserAuthenticated: OIDCUserAuthenticated,
             hostUserAuthenticated: hostUserAuthenticated,
-            hostProtected: hostCfg.protected,
-            hostAuthenticated: hostCfg.authenticated,
-            roomActive: roomActive,
             roomExist: roomExist,
             roomCount: roomCount,
-            roomId: roomId,
+            extraInfo: {
+                roomId: roomId,
+                OIDCUserEnabled: OIDC.enabled,
+                hostProtected: hostCfg.protected,
+                hostAuthenticated: hostCfg.authenticated,
+            },
             allowRoomAccess: allowRoomAccess,
         });
 
         return allowRoomAccess;
     }
 
-    function isRoomAllowedForUser(message, username, room) {
+    async function roomExistsForUser(room) {
+        if (hostCfg.protected || hostCfg.user_auth) {
+            // Check if passed room exists
+            if (hostCfg.users_from_db && hostCfg.api_room_exists) {
+                try {
+                    const response = await axios.post(
+                        hostCfg.api_room_exists,
+                        {
+                            room: room,
+                            api_secret_key: hostCfg.users_api_secret_key,
+                        },
+                        {
+                            timeout: 5000, // Timeout set to 5 seconds (5000 milliseconds)
+                        },
+                    );
+                    log.debug('AXIOS roomExistsForUser', { room: room, exists: true });
+                    return response.data && response.data.message === true;
+                } catch (error) {
+                    log.error('AXIOS roomExistsForUser error', error.message);
+                    return false;
+                }
+            }
+        }
+    }
+
+    async function getUserAllowedRooms(username, password) {
+        // Gel user allowed rooms from db...
+        if (hostCfg.protected && hostCfg.users_from_db && hostCfg.users_api_rooms_allowed) {
+            try {
+                // Using either email or username, as the username can also be an email here.
+                const response = await axios.post(
+                    hostCfg.users_api_rooms_allowed,
+                    {
+                        email: username,
+                        username: username,
+                        password: password,
+                        api_secret_key: hostCfg.users_api_secret_key,
+                    },
+                    {
+                        timeout: 5000, // Timeout set to 5 seconds (5000 milliseconds)
+                    },
+                );
+                const allowedRooms = response.data ? response.data.message : {};
+                log.debug('AXIOS getUserAllowedRooms', allowedRooms);
+                return allowedRooms;
+            } catch (error) {
+                log.error('AXIOS getUserAllowedRooms error', error.message);
+                return {};
+            }
+        }
+
+        // Get allowed rooms for user from config.js file
+        if (hostCfg.protected && !hostCfg.users_from_db) {
+            const isOIDCEnabled = config.oidc && config.oidc.enabled;
+
+            const user = hostCfg.users.find((user) => user.displayname === username || user.username === username);
+
+            if (!isOIDCEnabled && !user) {
+                log.debug('getUserAllowedRooms - user not found', username);
+                return false;
+            }
+            return user.allowed_rooms;
+        }
+
+        return ['*'];
+    }
+
+    async function isRoomAllowedForUser(message, username, room) {
         const logData = { message, username, room };
 
         log.debug('isRoomAllowedForUser ------>', logData);
@@ -3147,6 +3464,30 @@ function startServer() {
         const isOIDCEnabled = config.oidc && config.oidc.enabled;
 
         if (hostCfg.protected || hostCfg.user_auth) {
+            // Check if allowed room for user from DB...
+            if (hostCfg.users_from_db && hostCfg.users_api_room_allowed) {
+                try {
+                    // Using either email or username, as the username can also be an email here.
+                    const response = await axios.post(
+                        hostCfg.users_api_room_allowed,
+                        {
+                            email: username,
+                            username: username,
+                            room: room,
+                            api_secret_key: hostCfg.users_api_secret_key,
+                        },
+                        {
+                            timeout: 5000, // Timeout set to 5 seconds (5000 milliseconds)
+                        },
+                    );
+                    log.debug('AXIOS isRoomAllowedForUser', { room: room, allowed: true });
+                    return response.data && response.data.message === true;
+                } catch (error) {
+                    log.error('AXIOS isRoomAllowedForUser error', error.message);
+                    return false;
+                }
+            }
+
             const isInPresenterLists = config.presenters.list.includes(username);
 
             if (isInPresenterLists) {
@@ -3202,12 +3543,10 @@ function startServer() {
     function allowedIP(ip) {
         const authorizedIPs = authHost.getAuthorizedIPs();
         const authorizedIP = authHost.isAuthorizedIP(ip);
-        const isRoomActive = authHost.isRoomActive();
         log.info('Allowed IPs', {
             ip: ip,
             authorizedIP: authorizedIP,
             authorizedIPs: authorizedIPs,
-            isRoomActive: isRoomActive,
         });
         return authHost != null && authorizedIP;
     }
@@ -3221,9 +3560,65 @@ function startServer() {
                 log.info('Remove IP from auth', {
                     ip: ip,
                     authorizedIps: authHost.getAuthorizedIPs(),
-                    roomActive: authHost.isRoomActive(),
                 });
             }
         }
     }
+}
+
+// Initialize Supabase client
+let supabase;
+try {
+    if (config.supabase?.url && config.supabase?.key) {
+        supabase = createClient(config.supabase.url, config.supabase.key);
+    } else {
+        log.warn('Supabase configuration missing - room customization will be disabled');
+    }
+} catch (err) {
+    log.error('Failed to initialize Supabase client:', err);
+}
+
+// Function to get room info from Supabase
+async function getRoomInfo(roomId) {
+    if (!supabase) {
+        return null;
+    }
+    
+    try {
+        const { data, error } = await supabase
+            .from('room_info')
+            .select('room_name, room_picture_url, room_description')
+            .eq('room_name', roomId)
+            .single();
+            
+        if (error) throw error;
+        return data;
+    } catch (err) {
+        log.error('Error fetching room info:', err);
+        return null;
+    }
+}
+
+// Function to inject OG tags into HTML
+function injectOGTags(html, ogData) {
+    const defaultOG = {
+        title: 'Click the link to make a call.',
+        description: 'HiveTalk SFU calling provides real-time video calls, messaging and screen sharing.',
+        image: 'https://hivetalk.org/images/hivetalk.png'
+    };
+
+    const ogTitle = ogData?.room_name ? `Join ${ogData.room_name} on HiveTalk` : defaultOG.title;
+    const ogDescription = ogData?.room_description || defaultOG.description;
+    const ogImage = ogData?.room_picture_url || defaultOG.image;
+
+    return html.replace(
+        /<meta id="ogTitle"[^>]*>/,
+        `<meta id="ogTitle" property="og:title" content="${ogTitle}">`
+    ).replace(
+        /<meta id="ogDescription"[^>]*>/,
+        `<meta id="ogDescription" property="og:description" content="${ogDescription}">`
+    ).replace(
+        /<meta id="ogImage"[^>]*>/,
+        `<meta id="ogImage" property="og:image" content="${ogImage}">`
+    );
 }
